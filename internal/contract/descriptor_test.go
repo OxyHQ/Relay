@@ -99,6 +99,7 @@ var goShapes = map[string]reflect.Type{
 	"responseFormatSchema":         reflect.TypeOf(ResponseFormat{}),
 	"routingTargetSchema":          reflect.TypeOf(RoutingTarget{}),
 	"routingPolicyReferenceSchema": reflect.TypeOf(RoutingPolicyReference{}),
+	"authorizedRouteSchema":        reflect.TypeOf(AuthorizedRoute{}),
 
 	// The normalized stream.
 	"inferenceStreamStartEventSchema":       reflect.TypeOf(StreamStartEvent{}),
@@ -204,6 +205,10 @@ var notApplicable = map[string]string{
 	"modelProvenanceSchema":                 "catalogue: provenance is an Oxy publishing concern",
 	"modelPublisherSchema":                  "catalogue: Oxy owns publisher identity",
 	"modelRevisionSchema":                   "catalogue: Oxy owns revision identity",
+	"sha256DigestSchema":                    "catalogue: the artifact digest of a revision Relay never resolves; it reaches an upstream model id through its own snapshots",
+	"aliaModelReleaseManifestSchema":        "aliaModelRelease: Alia's model publishing pipeline; a release manifest is signed and consumed by Oxy, and the data plane is handed the resulting reference",
+	"aliaReleaseArtifactSchema":             "aliaModelRelease: an artifact of an Alia release manifest Oxy verifies before publishing",
+	"aliaReleaseSignatureSchema":            "aliaModelRelease: a signature over an Alia release manifest; Relay verifies the Oxy EDGE envelope, never a release",
 	"modelSafetyMetadataSchema":             "catalogue: safety metadata is published by Oxy",
 	"publisherSlugSchema":                   "catalogue: a component of a model id Relay never splits",
 	"modelSlugSchema":                       "catalogue: a component of a model id Relay never splits",
@@ -287,7 +292,7 @@ var notApplicable = map[string]string{
 
 // expectedNotApplicableCount is asserted exactly. Changing it is the moment to
 // ask whether a shape is being excused rather than implemented.
-const expectedNotApplicableCount = 71
+const expectedNotApplicableCount = 75
 
 type enumBinding struct {
 	goType  reflect.Type
@@ -782,6 +787,7 @@ var inlineEnumBindings = []enumBinding{
 	bindEnum(responseFormatTypeValues),
 	bindEnum(routingTargetKindValues),
 	bindEnum(routeSwitchScopeValues),
+	bindEnum(routeSubstitutionValues),
 	bindEnum(streamEventTypeValues),
 }
 

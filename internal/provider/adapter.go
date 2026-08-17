@@ -112,6 +112,43 @@ type Outcome struct {
 	TimeToFirstToken time.Duration
 }
 
+// CountRequest records the one unit an adapter measures without the provider's
+// help: that this request was served.
+//
+// ## The shape it exists to prevent
+//
+// `normalizedUsageReportSchema` refuses a `completed` report with an empty unit
+// list — "a completed request consumed something" — and the published policy for
+// one is refuse-and-release: the report is rejected and the hold is released. So
+// a provider that streams a full answer and omits its usage block, which several
+// do, produces a request that ran, cost Relay money upstream, and cannot be
+// settled at all.
+//
+// Both adapters' `normalizeUsage` already open with `requests: 1` for exactly
+// this reason, but they are only reached when a usage block ARRIVES. This is the
+// other path.
+//
+// ## Why it is called at the CLEAN end of a stream and nowhere else
+//
+// `requests: 1` is a count of the call, not an estimate of the model's work, so
+// it is honest to report — but only for a request that was actually served.
+// Adding it earlier would make a FAILED attempt carry a unit, and
+// `relay.outcomeFor` derives `partial` from "has units" and `failed` from "has
+// none": a failed request would start settling as a partial one, billing a
+// customer for output they never received. The unit therefore attaches once, at
+// the point the adapter knows the stream finished cleanly.
+//
+// Existing units are left alone: a provider that reported its own counts has
+// already included `requests`, and this must not double it.
+func CountRequest(units []contract.UsageQuantity) []contract.UsageQuantity {
+	for _, quantity := range units {
+		if quantity.Unit == contract.UnitRequests {
+			return units
+		}
+	}
+	return append(units, contract.UsageQuantity{Unit: contract.UnitRequests, Quantity: 1})
+}
+
 // HealthStatus is the coarse state of an adapter's upstream.
 type HealthStatus string
 

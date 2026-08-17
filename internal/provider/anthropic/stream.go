@@ -159,6 +159,10 @@ func (a *Adapter) readStream(ctx context.Context, body io.Reader, call *provider
 			return outcome, err
 		}
 	}
+	// The one unit this adapter measures itself, for the provider that reported
+	// none. See provider.CountRequest: a `completed` report with no units is
+	// refused by the contract and released rather than settled.
+	outcome.Units = provider.CountRequest(outcome.Units)
 	if outcome.FinishReason == "" {
 		outcome.FinishReason = contract.FinishStop
 	}
@@ -282,6 +286,10 @@ func (a *Adapter) readComplete(body io.Reader, call *provider.Call, out provider
 			return outcome, err
 		}
 	}
+	// The one unit this adapter measures itself, for the provider that reported
+	// none. See provider.CountRequest: a `completed` report with no units is
+	// refused by the contract and released rather than settled.
+	outcome.Units = provider.CountRequest(outcome.Units)
 	if outcome.FinishReason == "" {
 		outcome.FinishReason = contract.FinishStop
 	}

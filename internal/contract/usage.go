@@ -68,6 +68,20 @@ func (r *UsageReport) Validate() error {
 		}
 		seen[quantity.Unit] = struct{}{}
 	}
+	// A `completed` report asserts the customer received the whole answer, so
+	// "delivered in full, consumed nothing measurable" is a contradiction — and
+	// it is one that BILLS NOTHING, because settlement prices the reported units
+	// and sums. An empty list on a completed request is a free request produced
+	// by a provider that omitted its usage block.
+	//
+	// The rule is CONDITIONAL, exactly as published: `partial`, `failed` and
+	// `cancelled` legitimately carry no units, and in this build `failed` is
+	// DERIVED from having none (`outcomeFor`). An unconditional minimum would
+	// refuse those reports, and a refused report is a request that ran, cost
+	// money upstream, and can never be settled or refunded.
+	if r.Outcome == OutcomeCompleted && len(r.Units) == 0 {
+		return fmt.Errorf("contract: a completed request consumed something; report at least one unit")
+	}
 	started, err := r.StartedAt.Time()
 	if err != nil {
 		return fmt.Errorf("contract: startedAt: %w", err)

@@ -267,3 +267,52 @@ func TestTheTranslatedCallCarriesNoCredentialAndTheRequiredVersion(t *testing.T)
 func asUnsupported(err error, target *provider.ErrUnsupported) bool {
 	return errors.As(err, target)
 }
+
+// TestAReplayedRefusalIsRefusedBecauseThisProtocolHasNowhereToPutIt is the
+// dialect that CANNOT carry the `refusal` content part contract 1.2.0 added.
+//
+// The messages api has no refusal block: a refusal from the model arrives as
+// ordinary `text` with `stop_reason: "refusal"`. So the only way to replay one
+// would be to send it as text — which would tell the model that a refusal was the
+// assistant's own prose, and it would answer a different conversation while the
+// request reported success. `openaicompat` carries it on the message instead.
+//
+// The refusal is REFUSED with the part named, per this repo's rule that what a
+// provider cannot express is refused rather than dropped.
+func TestAReplayedRefusalIsRefusedBecauseThisProtocolHasNowhereToPutIt(t *testing.T) {
+	refusal := "I can't help with that."
+	request := baseRequest("req_replayed_refusal")
+	request.Input.Messages = []contract.Message{
+		{Role: contract.RoleUser, Content: []contract.ContentPart{textPart("do the thing")}},
+		{Role: contract.RoleAssistant, Content: []contract.ContentPart{
+			{Type: contract.ContentPartRefusal, Text: &refusal},
+		}},
+	}
+
+	_, err := newTestAdapter(t).Translate(request, testRoute())
+	var unsupported provider.ErrUnsupported
+	if !asUnsupported(err, &unsupported) {
+		t.Fatalf("a replayed refusal translated to %v; this protocol has no block for one", err)
+	}
+	if unsupported.Code != contract.CodeUnsupportedModality {
+		t.Errorf("refused with %q", unsupported.Code)
+	}
+	// The reason has to be the real one. "No representation for a %q part" would
+	// be true of a dialect that keeps it somewhere else, and only one of those is
+	// a request the customer can fix.
+	if !strings.Contains(unsupported.Detail, "stop_reason") {
+		t.Errorf("the refusal does not say why this protocol cannot carry it: %q", unsupported.Detail)
+	}
+
+	// THE CONTROL: the same conversation with an ordinary assistant text turn
+	// translates cleanly, so the refusal is about the part type and not about
+	// assistant messages or about this fixture.
+	control := baseRequest("req_replayed_text")
+	control.Input.Messages = []contract.Message{
+		{Role: contract.RoleUser, Content: []contract.ContentPart{textPart("do the thing")}},
+		{Role: contract.RoleAssistant, Content: []contract.ContentPart{textPart("sure")}},
+	}
+	if _, err := newTestAdapter(t).Translate(control, testRoute()); err != nil {
+		t.Fatalf("an ordinary assistant turn was refused too: %v", err)
+	}
+}

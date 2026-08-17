@@ -40,12 +40,12 @@ func TestWriteWireFixtures(t *testing.T) {
 	// directory looks like. They are exact rather than minimums for the same
 	// reason the not-applicable list is exact.
 	// 12 wire shapes plus the 6 credential-text strings the published schema
-	// must ACCEPT; 6 controls plus the 6 it must REJECT.
+	// must ACCEPT; 12 controls plus the 6 it must REJECT.
 	if len(valid) != 18 {
 		t.Fatalf("expected 18 valid fixtures, built %d; update the floor deliberately", len(valid))
 	}
-	if len(invalid) != 12 {
-		t.Fatalf("expected 12 invalid control fixtures, built %d; update the floor deliberately", len(invalid))
+	if len(invalid) != 18 {
+		t.Fatalf("expected 18 invalid control fixtures, built %d; update the floor deliberately", len(invalid))
 	}
 
 	writeFixtures(t, filepath.Join(fixtureDir, "valid"), valid)
@@ -141,8 +141,15 @@ func validFixtures(t *testing.T) []fixture {
 					},
 				},
 				{
-					Role:    RoleAssistant,
-					Content: []ContentPart{{Type: ContentPartText, Text: pointerTo("")}},
+					Role: RoleAssistant,
+					Content: []ContentPart{
+						{Type: ContentPartText, Text: pointerTo("")},
+						// The variant 1.2.0 added. It is CONTENT: the request
+						// succeeded and the provider billed for it, so a fixture
+						// that omitted it would leave the only new content
+						// variant unexercised on both sides of the wire.
+						{Type: ContentPartRefusal, Text: pointerTo("I can't help with that.")},
+					},
 					ToolCalls: []ToolCall{
 						{ID: "call_1", Name: "lookup", Arguments: `{"q":"x"}`},
 					},
@@ -188,6 +195,27 @@ func validFixtures(t *testing.T) []fixture {
 		},
 		IdempotencyKey: pointerTo(IdempotencyKey("idem_01JQZ")),
 		RoutingPolicy:  RoutingPolicyReference{RoutingPolicyID: "rp_01JQZ", PolicyVersion: 3},
+		// The list 1.2.0 added, in the order Oxy authorized it. This request PINS
+		// a revision, and the published refinement forbids a cross-model
+		// substitute for one — so the cross-model variant is exercised by
+		// `profileTarget` below, where it is legal, rather than here where it
+		// would make the whole fixture invalid.
+		AuthorizedRoutes: []AuthorizedRoute{
+			{
+				Substitution:   SubstitutionSameModel,
+				DeploymentID:   "dep_primary",
+				ModelReference: "openai/gpt-5@2026-05-01",
+				Provider:       "openai",
+				Regions:        []Region{"us-west-2", "us-east-1"},
+			},
+			{
+				Substitution:   SubstitutionSameModel,
+				DeploymentID:   "dep_secondary",
+				ModelReference: "openai/gpt-5@2026-05-01",
+				Provider:       "azure-openai",
+				Regions:        []Region{"eu-west-1"},
+			},
+		},
 	}
 	if err := request.Validate(); err != nil {
 		t.Fatalf("the request fixture does not satisfy Relay's own validation: %v", err)
@@ -198,6 +226,31 @@ func validFixtures(t *testing.T) []fixture {
 	textTarget.Input = Input{Format: InputText, Text: pointerTo("embed me")}
 	textTarget.Modality = ModalityEmbedding
 	textTarget.ToolChoice = &ToolChoice{Mode: pointerTo(ToolChoiceAuto)}
+	// A routing-profile target is where a cross-model substitute is legal: the
+	// customer named a strategy rather than weights, so the pinned-request
+	// refinement does not apply. This is the ONLY fixture that carries the
+	// `cross_model` variant, and it is here because a variant no fixture
+	// produces is a variant the published schema never checks Relay against.
+	textTarget.AuthorizedRoutes = []AuthorizedRoute{
+		{
+			Substitution:   SubstitutionSameModel,
+			DeploymentID:   "dep_primary",
+			ModelReference: "openai/gpt-5@2026-05-01",
+			Provider:       "openai",
+			Regions:        []Region{"us-west-2"},
+		},
+		{
+			Substitution:       SubstitutionCrossModel,
+			DeploymentID:       "dep_other_model",
+			ModelReference:     "anthropic/claude-4-5@2026-04-01",
+			Provider:           "anthropic",
+			Regions:            []Region{"us-west-2"},
+			AuthorizedByPolicy: pointerTo(true),
+		},
+	}
+	if err := textTarget.Validate(); err != nil {
+		t.Fatalf("the routing-profile fixture does not satisfy Relay's own validation: %v", err)
+	}
 
 	batch := textTarget
 	batch.Input = Input{Format: InputTextBatch, Texts: []string{"a", "b"}}
@@ -447,5 +500,108 @@ func invalidFixtures() []fixture {
 				"routingPolicy": map[string]any{"routingPolicyId": "rp_01JQZ", "policyVersion": 1},
 			},
 		},
+		// The union's own rule, in both directions. These are the two ways an
+		// authorized route can claim to be something it is not, and both must be
+		// refused by the PUBLISHED schema rather than only by Relay's own
+		// `validate` — otherwise Relay is the only thing holding a rule the wire
+		// is supposed to hold, and an Oxy-side bug would reach it as a legal
+		// envelope.
+		{
+			Schema: "inferenceRequestSchema",
+			Case:   "same-model-route-claiming-policy-authorization",
+			Value: requestWithAuthorizedRoutes(attribution, started, []map[string]any{{
+				"substitution": "same_model", "deploymentId": "dep_primary",
+				"modelReference": "openai/gpt-5@2026-05-01", "provider": "openai",
+				"regions": []string{"us-west-2"}, "authorizedByPolicy": true,
+			}}),
+		},
+		{
+			Schema: "inferenceRequestSchema",
+			Case:   "cross-model-route-without-policy-authorization",
+			Value: requestWithAuthorizedRoutes(attribution, started, []map[string]any{{
+				"substitution": "cross_model", "deploymentId": "dep_other_model",
+				"modelReference": "anthropic/claude-4-5@2026-04-01", "provider": "anthropic",
+				"regions": []string{"us-west-2"},
+			}}),
+		},
+		{
+			Schema: "inferenceRequestSchema",
+			Case:   "authorized-routes-sent-empty",
+			Value:  requestWithAuthorizedRoutes(attribution, started, []map[string]any{}),
+		},
+		// The three cross-field branches. `Candidates` reads `substitution`, so
+		// each of these is a way an envelope could talk Relay into serving
+		// weights nobody authorized, and each must be refused by the wire rather
+		// than only by Relay.
+		{
+			Schema: "inferenceRequestSchema",
+			Case:   "primary-route-claiming-to-be-a-substitution",
+			Value: requestWithAuthorizedRoutes(attribution, started, []map[string]any{{
+				"substitution": "cross_model", "deploymentId": "dep_primary",
+				"modelReference": "anthropic/claude-4-5@2026-04-01", "provider": "anthropic",
+				"regions": []string{"us-west-2"}, "authorizedByPolicy": true,
+			}}),
+		},
+		{
+			Schema: "inferenceRequestSchema",
+			Case:   "same-model-label-on-a-different-model-line",
+			Value: requestWithAuthorizedRoutes(attribution, started, []map[string]any{
+				{
+					"substitution": "same_model", "deploymentId": "dep_primary",
+					"modelReference": "openai/gpt-5@2026-05-01", "provider": "openai",
+					"regions": []string{"us-west-2"},
+				},
+				{
+					"substitution": "same_model", "deploymentId": "dep_other_model",
+					"modelReference": "anthropic/claude-4-5@2026-04-01", "provider": "anthropic",
+					"regions": []string{"us-west-2"},
+				},
+			}),
+		},
+		{
+			Schema: "inferenceRequestSchema",
+			Case:   "cross-model-substitute-for-a-pinned-request",
+			Value: pinnedRequestWithAuthorizedRoutes(attribution, started, []map[string]any{
+				{
+					"substitution": "same_model", "deploymentId": "dep_primary",
+					"modelReference": "openai/gpt-5@2026-05-01", "provider": "openai",
+					"regions": []string{"us-west-2"},
+				},
+				{
+					"substitution": "cross_model", "deploymentId": "dep_other_model",
+					"modelReference": "anthropic/claude-4-5@2026-04-01", "provider": "anthropic",
+					"regions": []string{"us-west-2"}, "authorizedByPolicy": true,
+				},
+			}),
+		},
 	}
+}
+
+// requestWithAuthorizedRoutes is the smallest legal envelope with an
+// `authorizedRoutes` list substituted in, so each control above is exactly one
+// mutation away from valid and the rejection can only be about the list.
+func requestWithAuthorizedRoutes(attribution any, started Timestamp, routes []map[string]any) map[string]any {
+	return map[string]any{
+		"schemaVersion": 1, "attribution": attribution,
+		"target":   map[string]any{"kind": "model", "modelReference": "openai/gpt-5"},
+		"modality": "text",
+		"input": map[string]any{
+			"format":   "messages",
+			"messages": []map[string]any{{"role": "user", "content": []map[string]any{{"type": "text", "text": "hi"}}}},
+		},
+		"stream": false, "sampling": map[string]any{}, "tools": []any{},
+		"client": map[string]any{
+			"apiFormat": "responses", "endpoint": "/v1/responses", "receivedAt": started,
+		},
+		"routingPolicy":    map[string]any{"routingPolicyId": "rp_01JQZ", "policyVersion": 1},
+		"authorizedRoutes": routes,
+	}
+}
+
+// pinnedRequestWithAuthorizedRoutes is the same envelope with a REVISION-PINNED
+// target, which is what makes the cross-model refinement apply at all.
+func pinnedRequestWithAuthorizedRoutes(attribution any, started Timestamp, routes []map[string]any) map[string]any {
+	request := requestWithAuthorizedRoutes(attribution, started, routes)
+	request["target"] = map[string]any{"kind": "model", "modelReference": "openai/gpt-5@2026-05-01"}
+	return request
 }

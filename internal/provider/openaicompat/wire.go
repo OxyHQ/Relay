@@ -39,8 +39,14 @@ type streamOptions struct {
 }
 
 type chatMessage struct {
-	Role       string         `json:"role"`
-	Content    any            `json:"content,omitempty"`
+	Role    string `json:"role"`
+	Content any    `json:"content,omitempty"`
+	// Refusal is where this protocol puts an assistant's refusal, on the MESSAGE
+	// rather than among its content parts — which is also where Relay READS one
+	// from on the way back (`completionMessage.Refusal`). The contract carries it
+	// as a content part, so the translation is structural; see
+	// `translateMessage`.
+	Refusal    *string        `json:"refusal,omitempty"`
 	Name       *string        `json:"name,omitempty"`
 	ToolCallID *string        `json:"tool_call_id,omitempty"`
 	ToolCalls  []chatToolCall `json:"tool_calls,omitempty"`

@@ -23,7 +23,7 @@ package contract
 // Asserted against the published package's INFERENCE_CONTRACT_VERSION by
 // contract_test.go, so bumping the pinned package without revisiting this
 // constant fails the build.
-const ContractVersion = "1.1.0"
+const ContractVersion = "1.2.0"
 
 // SchemaVersion is the per-shape version every whole-message shape in this
 // contract currently carries. Each shape declares it as a literal, so a

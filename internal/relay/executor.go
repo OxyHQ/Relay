@@ -462,16 +462,114 @@ func (e *Executor) resolve(request *contract.Request, at time.Time) ([]provider.
 	}
 
 	candidates := set.Candidates()
+
+	if len(request.AuthorizedRoutes) > 0 {
+		// The envelope carries the result of applying the customer's routing
+		// policy, so the authorization question is answered for this request and
+		// answered per request rather than per process.
+		authorized, failure := e.authorizedCandidates(request, set, candidates)
+		if failure != nil {
+			return nil, failure
+		}
+		e.order(authorized)
+		return authorized, nil
+	}
+
 	if !e.assumeFailoverAuthorized && len(candidates) > 1 {
-		// Choosing among the deployments of one reference — which to try first,
-		// and whether to try a second — is governed by routing-policy values
-		// the envelope does not carry. Without them Relay makes the weakest
-		// choice available to it: the deployment the inventory declared first,
-		// and no other. See Config.AssumeFailoverAuthorized.
+		// No list, and no process-wide acknowledgement. Choosing among the
+		// deployments of one reference — which to try first, and whether to try a
+		// second — is governed by routing-policy values this envelope does not
+		// carry. Without them Relay makes the weakest choice available to it: the
+		// deployment the inventory declared first, and no other. See
+		// Config.AssumeFailoverAuthorized.
 		candidates = candidates[:1]
 	}
 	e.order(candidates)
 	return candidates, nil
+}
+
+// authorizedCandidates narrows the inventory's routes to the ones the Oxy edge
+// authorized for THIS request, in the order it authorized them.
+//
+// ## What this does and does not decide
+//
+// It decides nothing about the customer. `provider` and `regions` on an entry
+// describe what Oxy already permitted and are not re-checked here — re-deriving
+// admissibility from them would rebuild, in Go, the enforcement engine the list
+// exists to remove. What the list gives Relay is a set and an order: a
+// deployment absent from it is unreachable because it never becomes a candidate,
+// which is a stronger statement than a check that could be forgotten.
+//
+// ## Cross-model entries are dropped, not refused
+//
+// A `cross_model` entry is contract-legal and Relay carries it, but it never
+// becomes a candidate. That keeps the guarantee `internal/inventory` and the
+// emitter are built on — every candidate for one request serves one model
+// reference — so the `route_switch` emitter still has no argument from which it
+// could describe a substitution. Making cross-model reachable is a separate
+// decision that has to revisit those two guarantees; see README.
+//
+// ## The reference check is defence in depth, and it is deliberate
+//
+// `Request.Validate` already refuses a `same_model` entry on a different model
+// line, and `Candidates` stamps one reference onto every route. This re-checks
+// the entry against the resolved set anyway, because serving weights the
+// customer did not ask for is the one failure this whole design exists to make
+// impossible, and it should not rest on a single check in one language.
+func (e *Executor) authorizedCandidates(
+	request *contract.Request,
+	set inventory.RouteSet,
+	candidates []provider.Route,
+) ([]provider.Route, *contract.Error) {
+	requestID := request.Attribution.RequestID
+
+	byDeployment := make(map[contract.DeploymentID]provider.Route, len(candidates))
+	for _, route := range candidates {
+		byDeployment[route.DeploymentID] = route
+	}
+
+	authorized := make([]provider.Route, 0, len(request.AuthorizedRoutes))
+	unknown := make([]contract.DeploymentID, 0, len(request.AuthorizedRoutes))
+	for _, entry := range request.AuthorizedRoutes {
+		if entry.Substitution != contract.SubstitutionSameModel {
+			continue
+		}
+		if entry.ModelReference != set.Reference() {
+			return nil, contract.NewError(requestID, contract.CodeInvalidRequest,
+				fmt.Sprintf("authorized route %q serves %q, but this request resolved to %q",
+					entry.DeploymentID, entry.ModelReference, set.Reference()),
+			).WithParam("authorizedRoutes")
+		}
+		route, servable := byDeployment[entry.DeploymentID]
+		if !servable {
+			// Oxy authorized a deployment this build cannot reach: its snapshot
+			// and Relay's inventory disagree. Skipped rather than fatal — the
+			// remaining entries are still authorized — but named in the refusal
+			// below if nothing is left, because "no route" and "no route I was
+			// allowed to use" send an operator to different places.
+			unknown = append(unknown, entry.DeploymentID)
+			continue
+		}
+		authorized = append(authorized, route)
+	}
+
+	if len(authorized) == 0 {
+		message := fmt.Sprintf("none of the %d authorized routes for this request is in this build's inventory", len(request.AuthorizedRoutes))
+		if len(unknown) > 0 {
+			message = fmt.Sprintf("%s (unknown deployments: %s)", message, joinDeployments(unknown))
+		}
+		return nil, contract.NewError(requestID, contract.CodeServiceUnavailable, message).
+			WithParam("authorizedRoutes")
+	}
+	return authorized, nil
+}
+
+func joinDeployments(ids []contract.DeploymentID) string {
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, string(id))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // order sorts candidates by rotation preference: deployments whose breakers

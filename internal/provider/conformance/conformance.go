@@ -267,12 +267,42 @@ func Run(t *testing.T, subject Subject) {
 		}
 	})
 
+	// A provider that omits its usage block is the case the contract is sharpest
+	// about, and this scenario asserted nothing about `units` — which is how the
+	// gap below went unnoticed.
+	//
+	// `normalizedUsageReportSchema` refuses a `completed` report with an empty
+	// unit list, and the policy for one is refuse-and-release: the report is
+	// rejected and the hold is released, never estimated and charged. So an
+	// adapter that streams a full answer and measures nothing produces a request
+	// that ran, cost Relay money upstream, and can never be settled — and it
+	// reaches Oxy looking like a success.
+	//
+	// Measured on this suite: with the assertion absent, both shipped adapters
+	// returned zero units for this scenario, while each one's own `normalizeUsage`
+	// documented `requests: 1` as "always reported" — true only on the path where
+	// a usage block ARRIVES, which is the one path this scenario does not take.
 	t.Run("settles a provider that reports no usage as an estimate", func(t *testing.T) {
 		run := execute(t, subject, ScenarioNoUsage, streamingRequest(subject), nil)
 		assertWellFramedStream(t, run)
 		assertReport(t, run, contract.OutcomeCompleted)
 		if run.report.UsageSource == contract.UsageProviderReported {
 			t.Error("the upstream reported nothing; the report claims the provider reported it")
+		}
+		if len(run.report.Units) == 0 {
+			t.Fatal("the report carries no units; the contract refuses a completed request that measured nothing, so this request could never be settled")
+		}
+		if !reportsUnit(run.report, contract.UnitRequests) {
+			t.Errorf("the report's units are %v; the request itself is the one thing an adapter measures without the provider's help",
+				run.report.Units)
+		}
+		// The counts the provider did not send must NOT be invented. Reporting a
+		// token quantity here would be a number nobody measured, arriving in the
+		// same shape as one a provider counted.
+		for _, quantity := range run.report.Units {
+			if quantity.Unit != contract.UnitRequests {
+				t.Errorf("the report claims %d %s the upstream never reported", quantity.Quantity, quantity.Unit)
+			}
 		}
 	})
 
@@ -884,3 +914,13 @@ func streamingRequest(subject Subject) *contract.Request {
 }
 
 func textOf(value string) *string { return &value }
+
+// reportsUnit is whether a report carries a quantity for one unit.
+func reportsUnit(report *contract.UsageReport, unit contract.UsageUnit) bool {
+	for _, quantity := range report.Units {
+		if quantity.Unit == unit {
+			return true
+		}
+	}
+	return false
+}

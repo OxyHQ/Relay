@@ -281,17 +281,46 @@ func translateMessage(message contract.Message) (chatMessage, error) {
 		})
 	}
 
+	// A refusal is lifted out of the content list and onto the message, because
+	// that is where this protocol keeps one — the same field Relay reads a
+	// refusal FROM on the way back. The contract models it as a content part
+	// (`inferenceContentPartSchema`'s `refusal` variant, contract 1.2.0), so
+	// replaying a conversation that contains one is only possible if the two
+	// shapes are reconciled here rather than at the customer.
+	//
+	// Dropping it instead would change the conversation the model sees while
+	// reporting success: an assistant turn that declined would come back as an
+	// assistant turn that said nothing.
+	remaining := make([]contract.ContentPart, 0, len(message.Content))
+	for _, part := range message.Content {
+		if part.Type != contract.ContentPartRefusal {
+			remaining = append(remaining, part)
+			continue
+		}
+		if translated.Refusal != nil {
+			// Two refusals in one message have no representation: the field holds
+			// one string, and joining them would invent a refusal the model never
+			// produced.
+			return chatMessage{}, provider.ErrUnsupported{
+				Code:   contract.CodeUnsupportedModality,
+				Detail: "chat completions carries one refusal per message; this message has two",
+			}
+		}
+		refusal := derefString(part.Text)
+		translated.Refusal = &refusal
+	}
+
 	// A single text part becomes a plain string rather than a one-element
 	// array. Several providers claiming OpenAI compatibility accept only the
 	// string form for system and tool messages, and the array form is the one
 	// that fails on them.
-	if len(message.Content) == 1 && message.Content[0].Type == contract.ContentPartText {
-		translated.Content = derefString(message.Content[0].Text)
+	if len(remaining) == 1 && remaining[0].Type == contract.ContentPartText {
+		translated.Content = derefString(remaining[0].Text)
 		return translated, nil
 	}
 
-	parts := make([]any, 0, len(message.Content))
-	for index, part := range message.Content {
+	parts := make([]any, 0, len(remaining))
+	for index, part := range remaining {
 		converted, err := translateContentPart(part)
 		if err != nil {
 			return chatMessage{}, annotate(err, fmt.Sprintf("content[%d]", index))
@@ -351,6 +380,16 @@ func translateContentPart(part contract.ContentPart) (any, error) {
 			FileData: dataURI(derefString(part.Source.MediaType), derefString(part.Source.Data)),
 			Filename: part.Filename,
 		}}, nil
+
+	case contract.ContentPartRefusal:
+		// Unreachable through `translateMessage`, which lifts a refusal onto the
+		// message before this runs. Named rather than left to the default arm so
+		// the reason is the real one — this protocol HAS a place for a refusal,
+		// just not among the content parts.
+		return nil, provider.ErrUnsupported{
+			Code:   contract.CodeUnsupportedModality,
+			Detail: "chat completions carries a refusal on the message, not as a content part",
+		}
 
 	default:
 		return nil, provider.ErrUnsupported{

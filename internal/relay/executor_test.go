@@ -398,12 +398,19 @@ func TestASuccessfulRequestProducesASettleableReport(t *testing.T) {
 
 // TestAnAdapterThatMeasuresNothingStillSaysHowItKnows: an estimate that is
 // indistinguishable from a provider's own count is one nobody can reconcile.
+//
+// The adapter reports the single unit a real one reports when its provider sent
+// no usage block — `provider.CountRequest` — and nothing else. That is the case
+// this test is about: the counts are absent, so the SOURCE has to say so.
 func TestAnAdapterThatMeasuresNothingStillSaysHowItKnows(t *testing.T) {
 	adapter := &scriptedAdapter{stream: func(_ context.Context, call *provider.Call, out provider.Emitter) (provider.Outcome, error) {
 		if err := out.Start(call.Route.ModelReference, time.Now()); err != nil {
 			return provider.Outcome{}, err
 		}
-		return provider.Outcome{FinishReason: contract.FinishStop}, nil
+		return provider.Outcome{
+			Units:        provider.CountRequest(nil),
+			FinishReason: contract.FinishStop,
+		}, nil
 	}}
 
 	_, result := execute(t, adapter, baseRequest())
@@ -413,6 +420,49 @@ func TestAnAdapterThatMeasuresNothingStillSaysHowItKnows(t *testing.T) {
 	}
 	if result.Report.UsageSource != contract.UsageEstimated {
 		t.Errorf("a report with no measurement claims source %q", result.Report.UsageSource)
+	}
+	if len(result.Report.Units) != 1 || result.Report.Units[0].Unit != contract.UnitRequests {
+		t.Errorf("the report's units are %v; the request itself is the one thing measured here", result.Report.Units)
+	}
+}
+
+// TestACompletedReportWithNoUnitsIsRefused is the executor's half of the
+// contract's `completed`-carries-a-unit rule.
+//
+// The published schema refuses that shape and the policy for one is
+// refuse-and-release: the report is rejected and the hold is released, never
+// estimated and charged. Every shipped adapter now attaches
+// `provider.CountRequest` at the clean end of a stream, so this is the gate for
+// the NEXT adapter — one that succeeds while measuring nothing produces a
+// request that ran, cost money upstream and can never be settled, and Relay must
+// say so rather than hand back a report that looks fine.
+func TestACompletedReportWithNoUnitsIsRefused(t *testing.T) {
+	measuring := &scriptedAdapter{stream: func(_ context.Context, call *provider.Call, out provider.Emitter) (provider.Outcome, error) {
+		if err := out.Start(call.Route.ModelReference, time.Now()); err != nil {
+			return provider.Outcome{}, err
+		}
+		return provider.Outcome{FinishReason: contract.FinishStop}, nil
+	}}
+
+	_, result := execute(t, measuring, baseRequest())
+
+	if result.Report != nil {
+		t.Fatalf("a completed report with no units was returned as settleable: %v", result.Report.Units)
+	}
+	if result.Failure == nil || result.Failure.Code != contract.CodeInternalError {
+		t.Fatalf("the caller was told %v", result.Failure)
+	}
+
+	// The control: the identical adapter with ONE unit is settled, so the
+	// refusal is the empty list and not the fixture.
+	counted := &scriptedAdapter{stream: func(_ context.Context, call *provider.Call, out provider.Emitter) (provider.Outcome, error) {
+		if err := out.Start(call.Route.ModelReference, time.Now()); err != nil {
+			return provider.Outcome{}, err
+		}
+		return provider.Outcome{Units: provider.CountRequest(nil), FinishReason: contract.FinishStop}, nil
+	}}
+	if _, control := execute(t, counted, baseRequest()); control.Report == nil {
+		t.Fatalf("the one-unit control produced no report either: %v", control.Failure)
 	}
 }
 

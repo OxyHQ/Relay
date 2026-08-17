@@ -451,6 +451,22 @@ func translateContentPart(part contract.ContentPart) (any, error) {
 			Detail: "the messages api has no audio content block",
 		}
 
+	case contract.ContentPartRefusal:
+		// REFUSED, and this is the dialect that cannot carry it. The messages api
+		// has no refusal block: a refusal from the model arrives as ordinary
+		// `text` with `stop_reason: "refusal"`, so the only way to replay one
+		// would be to send it as text — which would tell the model that Oxy's
+		// refusal was the assistant's own prose, and it would answer differently.
+		//
+		// Named rather than left to the default arm, because "this protocol has
+		// no place for it" and "this protocol keeps it somewhere else" are
+		// different answers and only one of them is a request the customer can
+		// fix. `openaicompat` is the dialect that carries it, on the message.
+		return nil, provider.ErrUnsupported{
+			Code:   contract.CodeUnsupportedModality,
+			Detail: "the messages api has no refusal content block; a refusal arrives as text with stop_reason refusal, so replaying one as text would change what the model is told",
+		}
+
 	default:
 		return nil, provider.ErrUnsupported{
 			Code:   contract.CodeUnsupportedModality,

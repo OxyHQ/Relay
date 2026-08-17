@@ -68,7 +68,7 @@ on top of it.
 
 ## The contract is not re-invented here
 
-`@oxyhq/contracts@0.29.0` (contract version 1.1.0) is the wire contract, and the Go types in
+`@oxyhq/contracts@0.30.0` (contract version 1.2.0) is the wire contract, and the Go types in
 `internal/contract` are hand-written against it. Hand-writing is only safe
 because two independent gates fail when the two sides diverge.
 
@@ -97,6 +97,45 @@ and reconciliation — every one of which is a control-plane concept this
 repository is forbidden to hold, so all 25 are recorded not-applicable with the
 reason naming the owner, and `expectedNotApplicableCount` moved in the same
 change.
+
+The bump to `0.30.0` is what it looks like when a version brings work rather
+than exemptions. Five shapes arrived and the gate named all five: `authorizedRoute`
+is **implemented**, because it is embedded in the request envelope and is the
+subject of the failover section below; `sha256Digest` and the three
+`aliaModelRelease` shapes are recorded not-applicable, because a signed model
+release manifest is Oxy's publishing pipeline and the data plane is handed the
+resulting reference. It also changed two shapes Relay already implements — a
+`refusal` content part, and the optional route list on the request — and the
+descriptor test named each one as a field or enum member Go was missing rather
+than leaving them to be noticed at runtime.
+
+### The `refusal` content part, and which dialect can carry one
+
+1.2.0's `refusal` variant is a REQUEST-side shape: it lets a customer replay a
+conversation in which the assistant declined. It is content and not a failure —
+the request succeeded and the provider billed for it — so it is normalized like
+any other part and never converted into an error.
+
+The two dialects answer differently, and the difference is stated rather than
+smoothed over:
+
+- **`openaicompat` carries it, on the MESSAGE.** This protocol keeps an
+  assistant's refusal in the message's own `refusal` field, which is also where
+  the adapter already READS one from on the way back. The contract models it as a
+  content part, so `translateMessage` lifts it out of the content list and onto
+  the field. Two refusals in one message are refused rather than joined: the field
+  holds one string, and concatenating them would invent a refusal the model never
+  produced.
+- **`anthropic` refuses it, with the real reason.** The messages api has no
+  refusal block; a refusal arrives as ordinary `text` with
+  `stop_reason: "refusal"`. Replaying one as text would tell the model that a
+  refusal was the assistant's own prose, and it would answer a different
+  conversation while the request reported success. So it is refused with
+  `unsupported_modality` and the reason names `stop_reason`, because "this
+  protocol has nowhere to put it" and "this protocol keeps it somewhere else" are
+  different answers and only one is a request the customer can fix.
+
+Neither adapter invents a field, which is the rule that decided both.
 
 **What it catches:** a field renamed, added, removed, or flipped between
 required and optional; a scalar's type changed; a reference repointed; a version
@@ -216,29 +255,70 @@ a cancellation, and any failure no adapter classified. One function decides,
 `provider.AttributableCategory`, and the circuit breakers read the same one, so
 the two can never drift apart.
 
-### The policy Relay is not sent, and what it does about it
+### The authorized route list, which is what authorizes failover
 
-**Failover is off by default, and that default is a contract finding rather than
-caution.** The published `routingFallbackPolicySchema` gives the customer two
-booleans that govern exactly this feature — `disabled` and
-`sameModelDeployment` — and `routingPolicySchema` adds `allowedRegions` and
-`deniedRegions`, which govern where a request may be served at all. The envelope
-carries a routing policy **reference** and none of those values. Relay therefore
-cannot tell a customer who asked for failover from one who switched it off, and
-failing over anyway would silently override a control the platform advertises.
+**Contract 1.2.0 answers the question this section used to be about.**
+`inferenceRequestSchema.authorizedRoutes` is an ordered list of routes the Oxy
+edge has ALREADY authorized for one request — deployment, model reference,
+provider, regions — primary first. Oxy filters candidate deployments against the
+customer's routing policy, which it can do because it holds the policy, and sends
+the RESULT.
 
-So with no authorisation, a reference resolves to its **declared primary
-deployment and nowhere else** — exactly how this build behaved before failover
-existed. Choosing among deployments at all is the policy decision, so health
-ordering is withheld too, not just the retry.
+That makes failover "take the next entry", and it means **no policy semantics
+exist in Go at all**. `provider` and `regions` on an entry describe what Oxy
+permitted; Relay does not filter on them, because re-deriving admissibility from
+them would rebuild the enforcement engine the list exists to remove, in the
+language with no schema to check it. A route outside the customer's policy is
+unreachable because it is **absent**, not because Relay declined it — which is
+the difference between a guarantee and a check somebody can forget.
 
-`RELAY_ASSUME_FAILOVER_AUTHORIZED=<reason>:<YYYY-MM-DD>` turns it on. It is
-deliberately awkward: it states that every caller of this process has a routing
-policy permitting same-model failover across every deployment in its inventory,
-which is true of a first-party canary and of nothing else. An empty value, a
-bare `true`, or a reason with no date either leave the default in place or
-refuse to start — never enable it. See item 11 below, which is the argument for
-the snapshot travelling.
+Three properties, each with a test that fails without it:
+
+- **A deployment the list does not name is never attempted**, even when the
+  inventory holds it and it is healthy.
+- **A `cross_model` entry never becomes a candidate.** Relay carries the variant
+  — the published union has two, and the descriptor gate requires both — but
+  `Candidates` filters to `same_model`, so the `route_switch` emitter still has
+  no argument from which it could describe a substitution. See "Explicitly out of
+  scope".
+- **The list's order is the tie-break.** Which routes are permitted is Oxy's;
+  which of the permitted ones is tried first when their breakers are equally
+  healthy is Relay's routing execution, so health ordering still applies and the
+  list's order decides the rest.
+
+A list naming only deployments this build cannot reach is a `service_unavailable`
+that NAMES them, because "no route" and "no route I was allowed to use" send an
+operator to different places — the catalogue in one case, the snapshot in the
+other.
+
+### The default is still OFF for a request with no list, and that is deliberate
+
+`authorizedRoutes` is **optional** in the contract, so an edge that has not been
+taught to send one sends none, and for those requests nothing has changed: the
+envelope still carries a routing policy **reference** and none of
+`routingFallbackPolicySchema`'s `disabled` / `sameModelDeployment` or
+`routingPolicySchema`'s `allowedRegions` / `deniedRegions`. Relay still cannot
+tell a customer who asked for failover from one who switched it off, so a
+reference resolves to its **declared primary deployment and nowhere else**, and
+health ordering is withheld with it.
+
+**Turning the default on would be wrong now for a sharper reason than before.** A
+missing list is no longer indistinguishable from "no policy" — it is a
+distinguishable state that means *this edge has not told me*, and the honest
+response to it is the same conservative one. It would also mask the rollout:
+failover switches on per customer, automatically, as soon as Oxy starts sending
+lists, and a global flag set in the meantime would make it impossible to tell
+whether the lists are arriving at all.
+
+`RELAY_ASSUME_FAILOVER_AUTHORIZED=<reason>:<YYYY-MM-DD>` still turns it on for
+requests that carry no list, and is now best read as a TRANSITIONAL
+acknowledgement for an edge that does not send them yet. It is deliberately
+awkward: it states that every caller of this process has a routing policy
+permitting same-model failover across every deployment in its inventory, which is
+true of a first-party canary and of nothing else. An empty value, a bare `true`,
+or a reason with no date either leave the default in place or refuse to start —
+never enable it. A request that carries a list ignores it entirely: the list is
+the authorization, and it is per request rather than per process.
 
 ## Circuit breakers and health scoring
 
@@ -553,13 +633,24 @@ cd tools/contract && npm ci && npm run generate && npm run validate
 Named here so nobody assumes otherwise. None of these is stubbed; each is simply
 absent, and the code refuses rather than pretending.
 
-- **Cross-model fallback.** Would require `routingFallbackPolicy`'s
-  `authorizedCrossModel` list, which arrives only inside the policy snapshot
-  Relay is not sent. Nothing here can express it: the route-switch event Relay
-  builds is deployment-scoped by construction.
-- **Failover without an operator acknowledgement.** Same-model failover is
-  built, tested and off by default, for the contract reason above and in item 11
-  below.
+- **Cross-model fallback.** Contract 1.2.0 made it EXPRESSIBLE — an
+  `authorizedRoute` entry may say `substitution: "cross_model"` with the literal
+  `authorizedByPolicy: true` — and Relay carries the variant, round-trips it and
+  has the published schema accept it. It never SELECTS one: `Candidates` filters
+  to `same_model`, so a cross-model route is not excluded downstream, it never
+  becomes a candidate.
+  **Enabling it is a separate change and a deliberate one**, because it has to
+  revisit two mutation-tested structural guarantees rather than relax a check:
+  `TestAnEndpointCannotCarryItsOwnModelReference`, and the emitter's refusal to
+  announce a switch whose origin and destination references differ. The
+  `route_switch` event Relay builds is deployment-scoped by construction and the
+  function that builds it takes no argument that could make it a substitution —
+  that is the property a cross-model build would have to give up, and it should be
+  reviewed as that rather than arriving inside a dependency bump.
+- **Failover without authorization.** Same-model failover is built and tested. A
+  request carrying an `authorizedRoutes` list is authorized by the list; a request
+  without one falls back to the declared primary unless an operator has set the
+  transitional acknowledgement. See the two failover sections above.
 - **Reconciliation of provider cost against provider invoices.** Relay measures
   what each request cost it upstream; matching that against what a provider
   actually billed is a finance process with no home in a data plane.
@@ -667,22 +758,22 @@ implemented against before. Each is a real gap, not a preference.
     emitted by mistake is silently stripped at Oxy's parse rather than caught.
     The request's `client` block *is* strict, and that strictness is what makes
     its privacy rule enforceable — the same argument applies to the rest.
-11. **The customer's own switch for same-model failover never reaches the data
-    plane that implements it.** `routingFallbackPolicySchema` carries
-    `disabled`, `sameModelDeployment` and `authorizedCrossModel`;
-    `routingPolicySchema` carries `allowedRegions` and `deniedRegions`. Every
-    one of them governs what this repository's failover does, and the envelope
-    carries none of them — only `{routingPolicyId, policyVersion}`. So a Relay
-    that failed over by default would override, for every customer who set it,
-    a control the platform advertises to them. This build therefore ships
-    failover **off**, and choosing among the deployments of one model at all is
-    withheld with it, since that choice is governed by the same values. It
-    cannot even be pre-implemented speculatively: adding a snapshot field to the
-    Go request type fails the descriptor gate, because the published shape does
-    not have one. **This is the concrete case for the snapshot travelling.**
-    Failing that, Oxy should state that it resolves the deployment as well as
-    the model, and send one — at which point Relay's inventory and Oxy's
-    catalogue need the direction of exchange that item 8 already asks for.
+11. **ANSWERED in contract 1.2.0 — the customer's own switch for same-model
+    failover now reaches the data plane, as a result rather than as a policy.**
+    This item asked for the routing policy snapshot to travel, and noted the
+    alternative: "Oxy should state that it resolves the deployment as well as the
+    model, and send one." That is what `inferenceRequestSchema.authorizedRoutes`
+    does, and it is the better of the two answers — a snapshot would have put
+    provider allowlists, residency and price ceilings into Go, where a second
+    enforcement engine would have to agree with Oxy's forever. A pre-authorized,
+    ordered list needs no policy semantics here at all.
+    Two halves of the original question remain open, and they are smaller:
+    **(a)** the field is optional, so a request without one is still a customer
+    Relay cannot read a failover preference for — see "The default is still OFF";
+    **(b)** an entry Oxy authorized that this build's inventory does not hold is
+    answered with `service_unavailable` naming the deployment, which is the
+    exchange-direction question item 8 already asks for, now with a concrete
+    symptom.
 12. **The contract specifies event shapes and not their order.** Relay emits
     `route_switch` *before* `start`, because the only switch it can safely
     perform is one where nothing has been streamed yet, and saying so in order

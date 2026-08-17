@@ -2,6 +2,7 @@ package relay_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -655,5 +656,336 @@ func TestAStaleSnapshotServesPinnedTargetsAndRefusesUnpinnedOnes(t *testing.T) {
 	fresh.issuedAt = time.Now()
 	if _, result := fresh.run(t, unpinned); result.Failure != nil {
 		t.Fatalf("a fresh snapshot refused an unpinned reference: %v", result.Failure)
+	}
+}
+
+/* -------------------------------------------------------------------------- */
+/*  The authorized route list (contract 1.2.0)                                */
+/* -------------------------------------------------------------------------- */
+
+// sameModelRoute is one entry of the list Oxy sends, for a deployment of the
+// fixture's single revision.
+func sameModelRoute(deployment contract.DeploymentID, slug contract.ProviderSlug, region contract.Region) contract.AuthorizedRoute {
+	return contract.AuthorizedRoute{
+		Substitution:   contract.SubstitutionSameModel,
+		DeploymentID:   deployment,
+		ModelReference: "stub/model@2026-05-01",
+		Provider:       slug,
+		Regions:        []contract.Region{region},
+	}
+}
+
+// requestAuthorizing returns the base request with an authorized route list.
+func requestAuthorizing(routes ...contract.AuthorizedRoute) *contract.Request {
+	request := baseRequest()
+	request.AuthorizedRoutes = routes
+	return request
+}
+
+// TestAnAuthorizedRouteListAuthorizesFailoverForOneRequest is the feature.
+//
+// Before 1.2.0 the only thing that could authorize choosing among deployments
+// was `RELAY_ASSUME_FAILOVER_AUTHORIZED`, a process-wide acknowledgement that is
+// true of a first-party canary and of nothing else. A list is per REQUEST and
+// carries the customer's own policy already applied, so this fixture leaves the
+// process-wide flag OFF — if it were on, the test would pass whether or not
+// Relay read the list at all.
+func TestAnAuthorizedRouteListAuthorizesFailoverForOneRequest(t *testing.T) {
+	primary := failingAdapter("stub", overloaded("stub"), nil)
+	secondary := succeedingAdapter("backup", 9)
+
+	events, result := harness{
+		deployments: twoDeploymentsOfOneRevision,
+		adapters:    []provider.Adapter{primary, secondary},
+		// Deliberately NOT set: the list is the authorization.
+		failoverAuthorized: false,
+	}.run(t, requestAuthorizing(
+		sameModelRoute("dep_a", "stub", "r1"),
+		sameModelRoute("dep_b", "backup", "r2"),
+	))
+
+	if result.Failure != nil {
+		t.Fatalf("a request whose list authorized a second route still failed: %v", result.Failure)
+	}
+	if primary.attempts() != 1 || secondary.attempts() != 1 {
+		t.Fatalf("attempts were primary=%d secondary=%d; the request was not failed over through the list",
+			primary.attempts(), secondary.attempts())
+	}
+	if result.Report == nil || result.Report.RouteSwitches != 1 {
+		t.Errorf("the report counts %v route switches", result.Report)
+	}
+	if len(eventsOfType(events, contract.EventRouteSwitch)) != 1 {
+		t.Errorf("%d route-switch events reached the customer", len(eventsOfType(events, contract.EventRouteSwitch)))
+	}
+
+	// THE CONTROL for this whole block: the same two adapters and the same
+	// inventory, with no list and no process flag, do NOT fail over. Without it
+	// every assertion above would also hold for a build that failed over
+	// unconditionally.
+	unauthorizedPrimary := failingAdapter("stub", overloaded("stub"), nil)
+	unauthorizedSecondary := succeedingAdapter("backup", 9)
+	if _, control := (harness{
+		deployments: twoDeploymentsOfOneRevision,
+		adapters:    []provider.Adapter{unauthorizedPrimary, unauthorizedSecondary},
+	}).run(t, baseRequest()); control.Failure == nil {
+		t.Fatal("without a list the same fixture succeeded, so the list is not what authorized the failover")
+	}
+	if unauthorizedSecondary.attempts() != 0 {
+		t.Fatalf("without a list the second deployment was attempted %d times", unauthorizedSecondary.attempts())
+	}
+}
+
+// TestADeploymentAbsentFromTheListIsUnreachable is the claim that makes the list
+// worth having: a route outside the customer's policy is not discouraged, it is
+// absent from the candidate set.
+//
+// The inventory holds both deployments and the second one is HEALTHY — the only
+// reason it is not used is that Oxy did not authorize it.
+func TestADeploymentAbsentFromTheListIsUnreachable(t *testing.T) {
+	primary := failingAdapter("stub", overloaded("stub"), nil)
+	unauthorized := succeedingAdapter("backup", 9)
+
+	events, result := harness{
+		deployments: twoDeploymentsOfOneRevision,
+		adapters:    []provider.Adapter{primary, unauthorized},
+		// On, so the refusal below cannot be the process-wide default: with this
+		// true and no list, Relay WOULD have failed over to dep_b.
+		failoverAuthorized: true,
+	}.run(t, requestAuthorizing(sameModelRoute("dep_a", "stub", "r1")))
+
+	if primary.attempts() != 1 {
+		t.Errorf("the authorized deployment was attempted %d times", primary.attempts())
+	}
+	if unauthorized.attempts() != 0 {
+		t.Fatalf("a deployment the list did not name was attempted %d times", unauthorized.attempts())
+	}
+	if len(eventsOfType(events, contract.EventRouteSwitch)) != 0 {
+		t.Error("a route switch was announced to a deployment nobody authorized")
+	}
+	if result.Failure == nil || result.Failure.Code != contract.CodeProviderOverloaded {
+		t.Fatalf("the customer was told %v; the only authorized route failed", result.Failure)
+	}
+}
+
+// TestACrossModelRouteIsNeverACandidate is the boundary guarantee.
+//
+// The envelope is contract-legal: a routing-profile-style request may carry a
+// `cross_model` entry stamped `authorizedByPolicy: true`, and Relay CARRIES it —
+// `internal/contract` round-trips it and the published schema accepts it. What
+// this asserts is that it never becomes a candidate, so the `route_switch`
+// emitter still cannot describe a substitution and no request is served on
+// weights the customer did not ask for.
+//
+// Making cross-model reachable is a separate decision that has to revisit
+// `TestAnEndpointCannotCarryItsOwnModelReference` and the emitter's refusal to
+// announce a switch whose references differ. This test is what fails if somebody
+// enables it here instead.
+func TestACrossModelRouteIsNeverACandidate(t *testing.T) {
+	primary := failingAdapter("stub", overloaded("stub"), nil)
+	other := succeedingAdapter("backup", 9)
+
+	request := requestAuthorizing(
+		sameModelRoute("dep_a", "stub", "r1"),
+		contract.AuthorizedRoute{
+			Substitution:   contract.SubstitutionCrossModel,
+			DeploymentID:   "dep_b",
+			ModelReference: "other/model@2026-05-01",
+			Provider:       "backup",
+			Regions:        []contract.Region{"r2"},
+			AuthorizedByPolicy: func() *bool {
+				authorized := true
+				return &authorized
+			}(),
+		},
+	)
+	// The envelope has to be legal for this to measure anything: an unpinned
+	// target, because the contract forbids a cross-model substitute for a request
+	// that pinned a revision.
+	unpinned := contract.ModelReference("stub/model")
+	request.Target = contract.RoutingTarget{Kind: contract.TargetModel, ModelReference: &unpinned}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("the fixture envelope is not contract-legal, so this test would measure the wrong refusal: %v", err)
+	}
+
+	events, result := harness{
+		deployments:        twoDeploymentsOfOneRevision,
+		adapters:           []provider.Adapter{primary, other},
+		failoverAuthorized: true,
+	}.run(t, request)
+
+	if other.attempts() != 0 {
+		t.Fatalf("a cross-model route was attempted %d times", other.attempts())
+	}
+	if len(eventsOfType(events, contract.EventRouteSwitch)) != 0 {
+		t.Error("a route switch was announced for a cross-model substitution")
+	}
+	// The customer is told what the SAME-MODEL route did — `provider_overloaded`,
+	// the primary's own failure — and not that their envelope was wrong.
+	//
+	// This is the assertion that makes the test discriminate, and it was measured:
+	// with only `result.Failure != nil` here, deleting the `same_model` filter
+	// left the test GREEN, because the cross-model entry then tripped the
+	// reference guard instead and the request still failed. Two guards refusing
+	// for different reasons look identical through a nil check.
+	if result.Failure == nil {
+		t.Fatal("the request succeeded; the only same-model route failed, so it was served across models")
+	}
+	if result.Failure.Code != contract.CodeProviderOverloaded {
+		t.Fatalf("the customer was told %q; the cross-model entry should never have become a candidate, leaving the primary's own failure",
+			result.Failure.Code)
+	}
+	if result.Report != nil && result.Report.RouteSwitches != 0 {
+		t.Errorf("the report counts %d route switches", result.Report.RouteSwitches)
+	}
+}
+
+// TestASameModelEntryNamingDifferentWeightsIsRefused covers the OTHER guard, the
+// one the cross-model filter cannot reach: an entry LABELLED `same_model` whose
+// reference is not the one this request resolved to.
+//
+// `Request.Validate` refuses that against the primary, and this refuses it
+// against the resolved route set — the two are different comparisons, and this is
+// the only one that can see a disagreement between Oxy's snapshot and Relay's
+// inventory. It is checked separately because a single test covering both guards
+// cannot fail for one of them.
+func TestASameModelEntryNamingDifferentWeightsIsRefused(t *testing.T) {
+	adapter := succeedingAdapter("stub", 3)
+
+	// The target is UNPINNED, and that is what makes this test measure the
+	// executor's guard rather than `Request.Validate`.
+	//
+	// Measured: with a pinned target, `Validate` refuses the entry first — a
+	// pinned request is served on exactly the revision it pinned — so deleting
+	// the executor guard left the test green. An unpinned target only requires
+	// the primary's model LINE to match, so an entry naming a different REVISION
+	// of the right line is contract-legal and reaches the executor. That is also
+	// the real case: Oxy's snapshot and Relay's inventory disagreeing about which
+	// revision is current.
+	unpinned := contract.ModelReference("stub/model")
+	request := requestAuthorizing(contract.AuthorizedRoute{
+		Substitution:   contract.SubstitutionSameModel,
+		DeploymentID:   "dep_a",
+		ModelReference: "stub/model@2026-01-01",
+		Provider:       "stub",
+		Regions:        []contract.Region{"r1"},
+	})
+	request.Target = contract.RoutingTarget{Kind: contract.TargetModel, ModelReference: &unpinned}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("the fixture envelope is not contract-legal, so this test would measure Validate instead of the executor: %v", err)
+	}
+
+	_, result := harness{
+		deployments: twoDeploymentsOfOneRevision,
+		adapters:    []provider.Adapter{adapter},
+	}.run(t, request)
+
+	if adapter.attempts() != 0 {
+		t.Fatalf("a route naming different weights was attempted %d times", adapter.attempts())
+	}
+	if result.Failure == nil || result.Failure.Code != contract.CodeInvalidRequest {
+		t.Fatalf("the customer was told %v", result.Failure)
+	}
+	if !strings.Contains(result.Failure.Message, "stub/model@2026-01-01") {
+		t.Errorf("the refusal does not name the reference it refused: %q", result.Failure.Message)
+	}
+
+	// The control: the same entry with the reference this request resolves to is
+	// served, so the refusal is the mismatch and not the guard refusing every
+	// list.
+	served := succeedingAdapter("stub", 3)
+	control := requestAuthorizing(sameModelRoute("dep_a", "stub", "r1"))
+	control.Target = contract.RoutingTarget{Kind: contract.TargetModel, ModelReference: &unpinned}
+	if _, result := (harness{
+		deployments: twoDeploymentsOfOneRevision,
+		adapters:    []provider.Adapter{served},
+	}).run(t, control); result.Failure != nil {
+		t.Fatalf("a correctly-referenced entry failed: %v", result.Failure)
+	}
+	if served.attempts() != 1 {
+		t.Fatal("the control did not reach the adapter, so the refusal above measures nothing")
+	}
+}
+
+// TestTheListsOrderIsTheTieBreak keeps Oxy's ordering meaningful without taking
+// health scoring away from Relay.
+//
+// Which routes are permitted is Oxy's; which of the permitted ones is tried
+// first when nothing distinguishes them is Relay's routing EXECUTION. With both
+// breakers closed the ranks are equal, so the stable sort leaves the list's own
+// order — and this asserts it by REVERSING the list and watching the served
+// deployment follow.
+func TestTheListsOrderIsTheTieBreak(t *testing.T) {
+	first := succeedingAdapter("stub", 3)
+	second := succeedingAdapter("backup", 3)
+	_, result := harness{
+		deployments: twoDeploymentsOfOneRevision,
+		adapters:    []provider.Adapter{first, second},
+	}.run(t, requestAuthorizing(
+		sameModelRoute("dep_b", "backup", "r2"),
+		sameModelRoute("dep_a", "stub", "r1"),
+	))
+	if result.Failure != nil {
+		t.Fatalf("the request failed: %v", result.Failure)
+	}
+	if second.attempts() != 1 || first.attempts() != 0 {
+		t.Fatalf("attempts were dep_a=%d dep_b=%d; the list named dep_b first", first.attempts(), second.attempts())
+	}
+
+	// The control: the same inventory, the same adapters, the list the other way
+	// round. If the served deployment did not move, the assertion above was
+	// measuring the inventory's declaration order instead of the list's.
+	reversedFirst := succeedingAdapter("stub", 3)
+	reversedSecond := succeedingAdapter("backup", 3)
+	if _, control := (harness{
+		deployments: twoDeploymentsOfOneRevision,
+		adapters:    []provider.Adapter{reversedFirst, reversedSecond},
+	}).run(t, requestAuthorizing(
+		sameModelRoute("dep_a", "stub", "r1"),
+		sameModelRoute("dep_b", "backup", "r2"),
+	)); control.Failure != nil {
+		t.Fatalf("the reversed request failed: %v", control.Failure)
+	}
+	if reversedFirst.attempts() != 1 || reversedSecond.attempts() != 0 {
+		t.Fatalf("with dep_a first, attempts were dep_a=%d dep_b=%d", reversedFirst.attempts(), reversedSecond.attempts())
+	}
+}
+
+// TestAnAuthorizedRouteThisBuildCannotServeIsRefusedByName covers the disagreement
+// between Oxy's snapshot and Relay's inventory.
+//
+// It is a `service_unavailable` and not a `model_not_found`: the model exists and
+// the customer is authorized for it, but every route Oxy permitted is one this
+// build cannot reach. Naming the deployments is what sends an operator to the
+// snapshot rather than to the catalogue.
+func TestAnAuthorizedRouteThisBuildCannotServeIsRefusedByName(t *testing.T) {
+	adapter := succeedingAdapter("stub", 3)
+
+	_, result := harness{
+		deployments: twoDeploymentsOfOneRevision,
+		adapters:    []provider.Adapter{adapter},
+	}.run(t, requestAuthorizing(sameModelRoute("dep_ghost", "stub", "r1")))
+
+	if adapter.attempts() != 0 {
+		t.Fatalf("a deployment outside the inventory was attempted %d times", adapter.attempts())
+	}
+	if result.Failure == nil || result.Failure.Code != contract.CodeServiceUnavailable {
+		t.Fatalf("the customer was told %v", result.Failure)
+	}
+	if !strings.Contains(result.Failure.Message, "dep_ghost") {
+		t.Errorf("the refusal does not name the deployment it could not reach: %q", result.Failure.Message)
+	}
+
+	// The control: the same request naming a deployment the inventory DOES hold
+	// is served, so the refusal above is about reachability and not about the
+	// list being read at all.
+	served := succeedingAdapter("stub", 3)
+	if _, control := (harness{
+		deployments: twoDeploymentsOfOneRevision,
+		adapters:    []provider.Adapter{served},
+	}).run(t, requestAuthorizing(sameModelRoute("dep_a", "stub", "r1"))); control.Failure != nil {
+		t.Fatalf("a list naming a real deployment failed: %v", control.Failure)
+	}
+	if served.attempts() != 1 {
+		t.Fatal("the control did not reach the adapter, so the refusal above measures nothing")
 	}
 }

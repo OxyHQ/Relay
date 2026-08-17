@@ -402,3 +402,90 @@ func TestFinishReasonsMapToTheContractsClosedSet(t *testing.T) {
 }
 
 func pointer[T any](value T) *T { return &value }
+
+// TestAReplayedRefusalTravelsOnTheMessageAndNotAsAContentPart covers the
+// `refusal` content part contract 1.2.0 added.
+//
+// This protocol keeps an assistant's refusal on the MESSAGE — the same field the
+// adapter reads a refusal from on the way back — while the contract models it as
+// a content part. The two shapes have to be reconciled here: a customer replaying
+// a conversation that contains a refusal cannot be asked to do it.
+//
+// Dropping it would be the silent failure. An assistant turn that DECLINED would
+// reach the model as an assistant turn that said nothing, and the model would
+// answer a different conversation while the request reported success.
+func TestAReplayedRefusalTravelsOnTheMessageAndNotAsAContentPart(t *testing.T) {
+	refusal := "I can't help with that."
+	body := translateToMap(t, requestWith([]contract.Message{
+		{Role: contract.RoleUser, Content: []contract.ContentPart{textPartOf("do the thing")}},
+		{Role: contract.RoleAssistant, Content: []contract.ContentPart{
+			{Type: contract.ContentPartRefusal, Text: &refusal},
+		}},
+		{Role: contract.RoleUser, Content: []contract.ContentPart{textPartOf("why not?")}},
+	}))
+
+	messages, ok := body["messages"].([]any)
+	if !ok || len(messages) != 3 {
+		t.Fatalf("the translated body carries %v messages", body["messages"])
+	}
+	assistant, ok := messages[1].(map[string]any)
+	if !ok {
+		t.Fatalf("the assistant message is %T", messages[1])
+	}
+	if assistant["refusal"] != refusal {
+		t.Errorf("the assistant message carries refusal %v, want %q", assistant["refusal"], refusal)
+	}
+	// It is NOT also a content part: sending both would show the model the same
+	// text twice, in a field the protocol does not define for it.
+	if content, present := assistant["content"]; present {
+		if rendered, _ := json.Marshal(content); strings.Contains(string(rendered), refusal) {
+			t.Errorf("the refusal is also in content: %s", rendered)
+		}
+	}
+
+	// THE CONTROL: an ordinary text part in the same position still travels as
+	// content and never as a refusal, so the assertion above is about the part
+	// TYPE and not about assistant messages generally.
+	control := translateToMap(t, requestWith([]contract.Message{
+		{Role: contract.RoleUser, Content: []contract.ContentPart{textPartOf("do the thing")}},
+		{Role: contract.RoleAssistant, Content: []contract.ContentPart{textPartOf("sure")}},
+	}))
+	controlMessages := control["messages"].([]any)
+	controlAssistant := controlMessages[1].(map[string]any)
+	if _, present := controlAssistant["refusal"]; present {
+		t.Errorf("an ordinary assistant message carries a refusal field: %v", controlAssistant["refusal"])
+	}
+	if controlAssistant["content"] != "sure" {
+		t.Errorf("the control assistant message carries content %v", controlAssistant["content"])
+	}
+}
+
+// TestTwoRefusalsInOneMessageAreRefusedRatherThanJoined: the field holds one
+// string, and concatenating two would invent a refusal the model never produced.
+func TestTwoRefusalsInOneMessageAreRefusedRatherThanJoined(t *testing.T) {
+	first, second := "no", "still no"
+	_, err := testAdapter(t).Translate(requestWith([]contract.Message{{
+		Role: contract.RoleAssistant,
+		Content: []contract.ContentPart{
+			{Type: contract.ContentPartRefusal, Text: &first},
+			{Type: contract.ContentPartRefusal, Text: &second},
+		},
+	}}), testRoute())
+
+	var unsupported provider.ErrUnsupported
+	if !errors.As(err, &unsupported) {
+		t.Fatalf("two refusals in one message translated to %v", err)
+	}
+	if unsupported.Code != contract.CodeUnsupportedModality {
+		t.Errorf("the refusal carries code %q", unsupported.Code)
+	}
+
+	// The control: ONE refusal in the same position translates cleanly, so the
+	// error is the duplication and not the part type.
+	if _, err := testAdapter(t).Translate(requestWith([]contract.Message{{
+		Role:    contract.RoleAssistant,
+		Content: []contract.ContentPart{{Type: contract.ContentPartRefusal, Text: &first}},
+	}}), testRoute()); err != nil {
+		t.Fatalf("one refusal was refused too: %v", err)
+	}
+}

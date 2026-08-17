@@ -43,9 +43,25 @@ const (
 	ContentPartImage ContentPartType = "image"
 	ContentPartAudio ContentPartType = "audio"
 	ContentPartFile  ContentPartType = "file"
+	// ContentPartRefusal is a refusal the MODEL produced, carried back as part
+	// of an assistant message rather than as an error.
+	//
+	// It is content, not a failure: the request succeeded, the provider billed
+	// for it and the customer is owed the text. Relay therefore normalizes it
+	// like any other part and never converts it into an `inferenceErrorSchema`
+	// — an adapter that mapped it to an error would refund a request the
+	// provider will invoice for, and would lose the only explanation the
+	// customer gets.
+	ContentPartRefusal ContentPartType = "refusal"
 )
 
-var contentPartTypeValues = []ContentPartType{ContentPartText, ContentPartImage, ContentPartAudio, ContentPartFile}
+var contentPartTypeValues = []ContentPartType{
+	ContentPartText,
+	ContentPartImage,
+	ContentPartAudio,
+	ContentPartFile,
+	ContentPartRefusal,
+}
 
 // ContentPart is one part of a message. A message is always a list of parts.
 type ContentPart struct {
@@ -227,6 +243,106 @@ type RoutingPolicyReference struct {
 	PolicyVersion   int    `json:"policyVersion"`
 }
 
+// RouteSubstitution says what KIND of substitution an authorized route entry
+// represents, and it is the contract's discriminator rather than a Relay idea.
+type RouteSubstitution string
+
+const (
+	// SubstitutionSameModel is the same model revision at a different
+	// deployment — the only substitution this build performs.
+	SubstitutionSameModel RouteSubstitution = "same_model"
+	// SubstitutionCrossModel is DIFFERENT WEIGHTS, and carrying it requires the
+	// contract's `authorizedByPolicy: true` literal. Relay represents it because
+	// the published union has two variants; it never selects one. See
+	// `AuthorizedRoute`.
+	SubstitutionCrossModel RouteSubstitution = "cross_model"
+)
+
+var routeSubstitutionValues = []RouteSubstitution{SubstitutionSameModel, SubstitutionCrossModel}
+
+// AuthorizedRoute is one route the Oxy edge has ALREADY authorized for this
+// request, in the order Oxy wants it tried.
+//
+// ## Why this exists, and what it replaces
+//
+// `RoutingPolicyReference` is a reference, so failover previously had nothing to
+// check a replacement against: no provider allowlist, no residency, no retention
+// requirement, no price ceiling. The answer is not to ship a policy engine here
+// — it is for Oxy to do the filtering it already does and send the RESULT. With
+// a list, failover is "take the next entry", and a route outside the customer's
+// policy is unreachable because it is absent, not because Relay declined it.
+// Nothing in this file interprets a policy, which is the property that matters.
+//
+// ## The fields are pre-authorization, NOT instructions to re-check
+//
+// `Provider` and `Regions` describe what Oxy authorized; Relay does not filter
+// on them. Re-deriving admissibility from them would rebuild the enforcement
+// engine this shape exists to avoid, in the language with no schema to check it.
+//
+// ## `AuthorizedByPolicy` and cross-model substitution
+//
+// The published union has two variants and Relay must be able to carry both, so
+// this struct is the flattened union: `AuthorizedByPolicy` is absent on a
+// `same_model` entry and the literal `true` on a `cross_model` one.
+//
+// **Relay never selects a `cross_model` entry.** `Candidates` filters to
+// `same_model`, so a cross-model route is not a case that is excluded downstream
+// but a value that never becomes a candidate — the same shape as the guarantee
+// in `internal/inventory`, where an `Endpoint` cannot carry its own model
+// reference. Making cross-model reachable is not a matter of relaxing a check
+// here: it would require the `route_switch` emitter to accept the substitution
+// arguments it is documented as not having, and it is deliberately a separate
+// decision (README, "Explicitly out of scope").
+type AuthorizedRoute struct {
+	Substitution   RouteSubstitution `json:"substitution"`
+	DeploymentID   DeploymentID      `json:"deploymentId"`
+	ModelReference ModelReference    `json:"modelReference"`
+	Provider       ProviderSlug      `json:"provider"`
+	Regions        []Region          `json:"regions"`
+	// AuthorizedByPolicy is the contract's `true` literal, present only on a
+	// `cross_model` entry. A pointer because its ABSENCE is what distinguishes
+	// the two variants on the wire.
+	AuthorizedByPolicy *bool `json:"authorizedByPolicy,omitempty"`
+}
+
+func (r AuthorizedRoute) validate() error {
+	if !isMember(r.Substitution, routeSubstitutionValues) {
+		return fmt.Errorf("%q is not a route substitution", r.Substitution)
+	}
+	if r.DeploymentID == "" {
+		return fmt.Errorf("deploymentId is required")
+	}
+	if !r.ModelReference.Valid() {
+		return fmt.Errorf("%q is not a model reference", r.ModelReference)
+	}
+	if !r.Provider.Valid() {
+		return fmt.Errorf("%q is not a provider slug", r.Provider)
+	}
+	if len(r.Regions) == 0 {
+		return fmt.Errorf("an authorized route must name at least one region")
+	}
+	for _, region := range r.Regions {
+		if !region.Valid() {
+			return fmt.Errorf("%q is not a region", region)
+		}
+	}
+	// The union's own rule, checked in BOTH directions. A `cross_model` entry
+	// without the literal is not a cross-model route Oxy authorized, and a
+	// `same_model` entry carrying it is an entry whose two halves disagree about
+	// what it is — either way the envelope means something nobody wrote.
+	switch r.Substitution {
+	case SubstitutionCrossModel:
+		if r.AuthorizedByPolicy == nil || !*r.AuthorizedByPolicy {
+			return fmt.Errorf("a cross_model route must carry authorizedByPolicy: true")
+		}
+	case SubstitutionSameModel:
+		if r.AuthorizedByPolicy != nil {
+			return fmt.Errorf("a same_model route must not carry authorizedByPolicy")
+		}
+	}
+	return nil
+}
+
 // ClientRequestMetadata is what the edge records about the CALL, as opposed to
 // its content.
 //
@@ -258,6 +374,12 @@ type Request struct {
 	Client          ClientRequestMetadata  `json:"client"`
 	IdempotencyKey  *IdempotencyKey        `json:"idempotencyKey,omitempty"`
 	RoutingPolicy   RoutingPolicyReference `json:"routingPolicy"`
+	// AuthorizedRoutes is the ordered list of routes Oxy has already authorized
+	// for this request, primary first. OPTIONAL in the contract, so an absent
+	// list is not a malformed envelope — it is an edge that has not been taught
+	// to send one, and Relay behaves exactly as it did before the field existed.
+	// See `AuthorizedRoute`.
+	AuthorizedRoutes []AuthorizedRoute `json:"authorizedRoutes,omitempty"`
 }
 
 // Validate carries the per-variant and cross-field rules the Go types cannot
@@ -300,6 +422,85 @@ func (r *Request) Validate() error {
 			return fmt.Errorf("contract: tool names must be unique within one request (%q repeats)", tool.Name)
 		}
 		seenTools[tool.Name] = struct{}{}
+	}
+	return r.validateAuthorizedRoutes()
+}
+
+// validateAuthorizedRoutes restates the published refinement on
+// `authorizedRoutes`, branch for branch.
+//
+// These are CROSS-FIELD rules the Go types cannot express, and they are mirrored
+// here rather than left to Oxy for one reason: `Candidates` reads
+// `Substitution`, so a mislabelled entry — `same_model` on different weights —
+// is the one input that could make Relay serve a model the customer did not ask
+// for. The contract refuses it, and this is Relay refusing to be the only thing
+// that did not check. `internal/contract/testdata` feeds each branch to the
+// published schema as a rejection control, so the two enforcements are held
+// against each other rather than assumed to agree.
+func (r *Request) validateAuthorizedRoutes() error {
+	// `.min(1)` upstream. An EMPTY list is refused rather than read as "no
+	// list": the two mean opposite things — nothing authorized versus nothing
+	// sent — and treating an explicit emptiness as an absence is how a request
+	// gets served through a route nobody authorized.
+	if r.AuthorizedRoutes != nil && len(r.AuthorizedRoutes) == 0 {
+		return fmt.Errorf("contract: authorizedRoutes was sent empty; omit the field or name at least one route")
+	}
+	if len(r.AuthorizedRoutes) == 0 {
+		return nil
+	}
+
+	seenDeployments := make(map[DeploymentID]struct{}, len(r.AuthorizedRoutes))
+	for index, route := range r.AuthorizedRoutes {
+		if err := route.validate(); err != nil {
+			return fmt.Errorf("contract: authorizedRoutes[%d]: %w", index, err)
+		}
+		// Failing over to the deployment that just failed is not failover, and
+		// the duplicate would make `routeSwitches` count a switch that changed
+		// nothing.
+		if _, duplicate := seenDeployments[route.DeploymentID]; duplicate {
+			return fmt.Errorf("contract: authorizedRoutes names deployment %q more than once", route.DeploymentID)
+		}
+		seenDeployments[route.DeploymentID] = struct{}{}
+	}
+
+	// The primary is not a substitution for itself, and every other entry's
+	// `substitution` is read RELATIVE to it.
+	primary := r.AuthorizedRoutes[0]
+	if primary.Substitution != SubstitutionSameModel {
+		return fmt.Errorf("contract: the first authorized route is the primary and cannot be a substitution")
+	}
+	primaryLine := primary.ModelReference.ModelID()
+
+	if r.Target.Kind == TargetModel && r.Target.ModelReference != nil {
+		target := *r.Target.ModelReference
+		if target.Pinned() {
+			// A pinned request is served on exactly those weights, so the
+			// primary must BE them and no substitute may cross the model line.
+			if primary.ModelReference != target {
+				return fmt.Errorf("contract: a pinned request is served on exactly the revision it pinned (%q), not %q", target, primary.ModelReference)
+			}
+			for index, route := range r.AuthorizedRoutes {
+				if route.Substitution == SubstitutionCrossModel {
+					return fmt.Errorf("contract: authorizedRoutes[%d]: a request that pinned a revision authorizes no cross-model substitute", index)
+				}
+			}
+		} else if primaryLine != ModelID(target) {
+			return fmt.Errorf("contract: the primary authorized route must serve the model the request named (%q), not %q", target, primaryLine)
+		}
+	}
+
+	// A mislabelled entry is the whole failure mode. `same_model` on a different
+	// line is a substitution wearing the label that needs no authorization;
+	// `cross_model` on the same line claims an authorization the customer never
+	// had to give.
+	for index, route := range r.AuthorizedRoutes {
+		line := route.ModelReference.ModelID()
+		if route.Substitution == SubstitutionSameModel && line != primaryLine {
+			return fmt.Errorf("contract: authorizedRoutes[%d] serves %q, not %q, so it is a cross-model substitute", index, line, primaryLine)
+		}
+		if route.Substitution == SubstitutionCrossModel && line == primaryLine {
+			return fmt.Errorf("contract: authorizedRoutes[%d] serves %q, so it is same-model failover", index, primaryLine)
+		}
 	}
 	return nil
 }
@@ -380,9 +581,9 @@ func (m Message) validate() error {
 
 func (p ContentPart) validate() error {
 	switch p.Type {
-	case ContentPartText:
+	case ContentPartText, ContentPartRefusal:
 		if p.Text == nil {
-			return fmt.Errorf("a text part must carry text")
+			return fmt.Errorf("a %s part must carry text", p.Type)
 		}
 	case ContentPartImage, ContentPartAudio, ContentPartFile:
 		if p.Source == nil {
